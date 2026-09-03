@@ -1,0 +1,1 @@
+Run `npx prisma migrate dev --name init` from the backend directory after creating the MySQL database. Prisma will create the migration from `schema.prisma` and preserve the unique user/store rating constraint.

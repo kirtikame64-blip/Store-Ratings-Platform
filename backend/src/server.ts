@@ -1,0 +1,38 @@
+import 'dotenv/config';
+import express, { NextFunction, Request, Response } from 'express';
+import cors from 'cors';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import { body, param, query, validationResult } from 'express-validator';
+import { PrismaClient, Role } from '@prisma/client';
+
+const prisma = new PrismaClient();
+const app = express();
+const port = Number(process.env.PORT || 4000);
+const jwtSecret = process.env.JWT_SECRET || 'development-only-secret';
+
+type AuthRequest = Request & { user?: { id: number; role: Role } };
+const validate = (req: Request, res: Response, next: NextFunction) => { const errors = validationResult(req); if (!errors.isEmpty()) return res.status(400).json({ message: 'Please check the highlighted fields.', errors: errors.array() }); next(); };
+const auth = (req: AuthRequest, res: Response, next: NextFunction) => { const token = req.headers.authorization?.replace('Bearer ', ''); if (!token) return res.status(401).json({ message: 'Authentication required.' }); try { req.user = jwt.verify(token, jwtSecret) as { id: number; role: Role }; next(); } catch { return res.status(401).json({ message: 'Session expired. Please sign in again.' }); } };
+const allow = (...roles: Role[]) => (req: AuthRequest, res: Response, next: NextFunction) => { if (!req.user || !roles.includes(req.user.role)) return res.status(403).json({ message: 'You do not have permission for this action.' }); next(); };
+const userRules = [body('name').isLength({ min: 20, max: 60 }).withMessage('Name must be 20–60 characters.'), body('email').isEmail().withMessage('Enter a valid email.'), body('password').matches(/^(?=.*[A-Z])(?=.*[^A-Za-z0-9]).{8,16}$/).withMessage('Password must be 8–16 characters with an uppercase letter and special character.'), body('address').isLength({ max: 400 }).withMessage('Address must be 400 characters or fewer.')];
+const ratingRules = [body('score').isInt({ min: 1, max: 5 }).withMessage('Rating must be an integer from 1 to 5.')];
+
+app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173' }));
+app.use(express.json());
+app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
+
+app.post('/api/auth/signup', userRules, validate, async (req, res, next) => { try { const passwordHash = await bcrypt.hash(req.body.password, 12); const user = await prisma.user.create({ data: { name: req.body.name, email: req.body.email.toLowerCase(), passwordHash, address: req.body.address, role: Role.USER } }); res.status(201).json({ id: user.id, email: user.email }); } catch (error) { next(error); } });
+app.post('/api/auth/login', [body('email').isEmail(), body('password').notEmpty()], validate, async (req, res, next) => { try { const user = await prisma.user.findUnique({ where: { email: req.body.email.toLowerCase() } }); if (!user || !(await bcrypt.compare(req.body.password, user.passwordHash))) return res.status(401).json({ message: 'Invalid email or password.' }); const token = jwt.sign({ id: user.id, role: user.role }, jwtSecret, { expiresIn: '8h' }); res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } }); } catch (error) { next(error); } });
+app.get('/api/auth/me', auth, async (req: AuthRequest, res, next) => { try { const user = await prisma.user.findUnique({ where: { id: req.user!.id }, select: { id: true, name: true, email: true, address: true, role: true } }); res.json(user); } catch (error) { next(error); } });
+
+app.get('/api/stores', auth, [query('search').optional().isString(), query('sort').optional().isIn(['name', 'address', 'rating'])], validate, async (req, res, next) => { try { const search = String(req.query.search || ''); const stores = await prisma.store.findMany({ where: search ? { OR: [{ name: { contains: search } }, { address: { contains: search } }] } : undefined, include: { ratings: { select: { score: true, userId: true } } }, orderBy: req.query.sort === 'address' ? { address: 'asc' } : { name: 'asc' } }); res.json(stores.map((store) => ({ id: store.id, name: store.name, address: store.address, rating: store.ratings.length ? Number((store.ratings.reduce((sum, item) => sum + item.score, 0) / store.ratings.length).toFixed(1)) : 0, reviews: store.ratings.length, yourRating: store.ratings.find((item) => item.userId === req.user!.id)?.score || null }))); } catch (error) { next(error); } });
+app.post('/api/stores', auth, allow(Role.ADMIN), [body('name').isLength({ min: 20, max: 60 }), body('address').isLength({ max: 400 }), body('ownerId').optional().isInt()], validate, async (req, res, next) => { try { const store = await prisma.store.create({ data: { name: req.body.name, address: req.body.address, ownerId: req.body.ownerId || null } }); res.status(201).json(store); } catch (error) { next(error); } });
+app.get('/api/users', auth, allow(Role.ADMIN), [query('search').optional().isString()], validate, async (req, res, next) => { try { const search = String(req.query.search || ''); const users = await prisma.user.findMany({ where: search ? { OR: [{ name: { contains: search } }, { email: { contains: search } }, { address: { contains: search } }] } : undefined, select: { id: true, name: true, email: true, address: true, role: true, createdAt: true }, orderBy: { name: 'asc' } }); res.json(users); } catch (error) { next(error); } });
+app.post('/api/users', auth, allow(Role.ADMIN), userRules.concat(body('role').isIn(['ADMIN', 'USER', 'OWNER'])), validate, async (req, res, next) => { try { const passwordHash = await bcrypt.hash(req.body.password, 12); const user = await prisma.user.create({ data: { name: req.body.name, email: req.body.email.toLowerCase(), passwordHash, address: req.body.address, role: req.body.role } }); res.status(201).json({ id: user.id, email: user.email }); } catch (error) { next(error); } });
+app.put('/api/ratings/:storeId', auth, ratingRules.concat(param('storeId').isInt()), validate, async (req: AuthRequest, res, next) => { try { const rating = await prisma.rating.upsert({ where: { userId_storeId: { userId: req.user!.id, storeId: Number(req.params.storeId) } }, update: { score: req.body.score }, create: { score: req.body.score, userId: req.user!.id, storeId: Number(req.params.storeId) } }); res.json(rating); } catch (error) { next(error); } });
+app.get('/api/owner/ratings', auth, allow(Role.OWNER), async (req: AuthRequest, res, next) => { try { const rows = await prisma.rating.findMany({ where: { store: { ownerId: req.user!.id } }, include: { user: { select: { name: true, email: true } }, store: { select: { name: true } } }, orderBy: { createdAt: 'desc' } }); res.json(rows); } catch (error) { next(error); } });
+app.patch('/api/auth/password', auth, [body('currentPassword').notEmpty(), body('newPassword').matches(/^(?=.*[A-Z])(?=.*[^A-Za-z0-9]).{8,16}$/)], validate, async (req: AuthRequest, res, next) => { try { const user = await prisma.user.findUniqueOrThrow({ where: { id: req.user!.id } }); if (!(await bcrypt.compare(req.body.currentPassword, user.passwordHash))) return res.status(400).json({ message: 'Current password is incorrect.' }); await prisma.user.update({ where: { id: user.id }, data: { passwordHash: await bcrypt.hash(req.body.newPassword, 12) } }); res.json({ message: 'Password updated.' }); } catch (error) { next(error); } });
+
+app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => { console.error(error); if (typeof error === 'object' && error && 'code' in error && error.code === 'P2002') return res.status(409).json({ message: 'That email or record already exists.' }); res.status(500).json({ message: 'Something went wrong. Please try again.' }); });
+app.listen(port, () => console.log(`Northstar API listening on port ${port}`));
